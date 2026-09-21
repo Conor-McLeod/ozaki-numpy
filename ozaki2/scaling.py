@@ -1,32 +1,46 @@
 """Scaling, phases A-D: turn floating-point A and B into integer matrices.
 
-CUDA counterparts:
+Paper: Section 3 step 2 and Section 4.2 "accurate mode" (Algorithm 1
+lines 1-3). CUDA counterparts:
     par_gemmul8/src/seq/seq_scaling.cu          seq::scaling (the orchestrator)
     include/ozaki/scaling_accu.hpp              phases A and C
     include/ozaki/scaling_trunc.hpp             upper_bound_int8, TruncScalbn
     include/ozaki/scaling_core.hpp              phase D
     include/ozaki/find_max.hpp                  the amax reductions
 
-Goal: find a power-of-two scale per row of A and per column of B,
+Goal (paper step 2): find scale vectors mu (one power of two per row of A) and
+nu (one per column of B), and truncate
 
-    A_core = trunc(A * 2^-shiftA[i])      (row i)
-    B_core = trunc(B * 2^-shiftB[j])      (column j)
+    A' = trunc(diag(mu) @ A)        par_gemmul8: A_core
+    B' = trunc(B @ diag(nu))        par_gemmul8: B_core
 
-such that A_core and B_core are integers and every entry of A_core @ B_core
-is guaranteed to satisfy |X| < M/2 (M = product of the moduli). That bound is
-what lets the CRT reconstruct X exactly from its residues later. Within that
-bound, the shifts are chosen to keep as many bits of A and B as possible.
+so that A' and B' are integer matrices satisfying (paper eq. 3)
 
-The "accurate" scaling in par_gemmul8 finds the shifts in two passes:
+    2 * sum_h |a'_ih| |b'_hj| < 𝒫     for all i, j,
 
-  A. Pick a first, rough shift per row/column so that the row's largest
-     element lands in [32, 64). Round |A| *up* to integers at that scale to get
-     a small int8 upper bound, A_bound.
-  B. C_hi = A_bound @ B_bound: one int8 GEMM that gives an upper bound on
-     |A| @ |B| (in those rough scaled units) without any floating-point GEMM.
-  C. From the largest C_hi entry in row i / column j, work out how many
-     more bits row i of A and column j of B can afford, and refine the shifts.
-  D. Apply the final shifts and truncate: A_core, B_core.
+where 𝒫 is the product of the moduli (crt_tables.py). Then every entry of
+A' @ B' has |x| < 𝒫/2, the range in which the CRT pins x down uniquely.
+Within that bound, the scales are chosen to keep as many bits of A and B as
+possible.
+
+par_gemmul8 stores exponents, not the powers of two. After phase C,
+mu_i = 2^-shiftA[i] and nu_j = 2^-shiftB[j].
+
+Accurate mode finds the scales in two passes (the phase letters are from
+par_gemmul8's seq_scaling.hpp):
+
+  A. mu'_i = 2^(5 - floor(log2 max_h |a_ih|)) (nu'_j likewise), so the row's
+     largest element lands in [32, 64). Round up at that scale:
+     Abar = ceil(diag(mu') |A|). That's a small nonnegative int8 matrix
+     (par_gemmul8: A_bound; mu'_i = 2^shiftA0[i]).
+  B. Cbar = Abar @ Bbar: one int8 GEMM that bounds diag(mu')|A||B|diag(nu')
+     entrywise, without any floating-point GEMM (par_gemmul8: C_hi).
+  C. From the largest Cbar entry in row i / column j, work out how many
+     more bits row i of A and column j of B can afford: mu, nu.
+  D. Apply the final scales and truncate: A', B'.
+
+The paper's alternative "fast mode" skips phases A-B and bounds the sum with
+Cauchy-Schwarz instead (eq. 7). par_gemmul8 only implements accurate mode.
 
 Differences from the CUDA code, none of which change the result:
   * Layout: numpy's natural row-major (m, k) / (k, n) arrays. The CUDA code is
@@ -116,19 +130,22 @@ def int8_gemm(A_i8, B_i8):
     cublasGemmEx with CUDA_R_8I inputs and CUBLAS_COMPUTE_32I).
 
     numpy has no int8 GEMM with int32 accumulation, so we widen the inputs to
-    int32 first. The result is identical as long as the int32 sum doesn't
-    overflow: |entry| <= 128*128*k < 2^31 needs k < 2^17. ozaki_gemm checks it.
+    int32 first. numpy's integer matmul wraps on overflow, as the int32
+    accumulator in cuBLAS does, so the results match bit for bit. Paper
+    Section 4.3: for k <= 2^17 the only possible overflow is an entry of
+    exactly 2^31 (k products of -128 * -128 in the p = 256 plane), which
+    wraps to -2^31. Both are 0 mod 256, so the residue is still right.
+    ozaki_gemm rejects k > 2^17.
     """
     return np.matmul(A_i8.astype(np.int32), B_i8.astype(np.int32))
 
 
 def bound_gemm(A_bound, B_bound):
-    """Phase B: C_hi = A_bound @ B_bound.
+    """Phase B: Cbar = Abar @ Bbar (par_gemmul8: C_hi = A_bound @ B_bound,
+    written inline in seq::scaling).
 
-    Every entry of A_bound and B_bound is >= the magnitude of the scaled
-    element it came from, so C_hi[i, j] >= sum_l |A[i,l]| |B[l,j]| (scaled by
-    2^(shiftA[i] + shiftB[j])). C_hi bounds the magnitude of every term that
-    can appear in the product.
+    Every entry of Abar and Bbar is >= the magnitude of the scaled element it
+    came from, so Cbar_ij >= mu'_i * sum_h |a_ih| |b_hj| * nu'_j.
     """
     return int8_gemm(A_bound, B_bound)
 
@@ -138,23 +155,27 @@ def bound_gemm(A_bound, B_bound):
 
 def compute_shift(amax, num_moduli):
     """How many extra bits a row/column can afford, given the largest entry
-    `amax` (int32) of its row/column of C_hi (scaling_accu.hpp:
+    `amax` (int32) of its row/column of Cbar (scaling_accu.hpp:
     compute_shift<num_moduli>).
 
+    Paper, accurate mode:
+        mu_i = mu'_i * 2^floor(𝒫'_accu - 0.51 * log2(max_h Cbar_ih))
     CUDA, in float32:
         log2amax = __log2f(float(amax))
         return floor_rd( fma_rd(-0x1.000006p-1, log2amax, log2P) )
 
-    Idea: C_hi says that row i of A times column j of B produces at most
-    2^log2(amax), in the rough units. There are log2P ~ log2(M)/2 - 0.5 bits of
-    budget *per factor*. The row's result spends log2(amax) of them in total,
-    so each factor gets back log2P - log2(amax)/2 more bits.
+    Idea: Cbar says that row i of A times any column of B produces at most
+    2^log2(amax), in the phase-A units. There are 𝒫'_accu = log2P ~
+    log2(𝒫)/2 - 0.5 bits of budget *per factor*. The row's result spends
+    log2(amax) of them in total, so each factor gets back
+    log2P - log2(amax)/2 more bits.
 
-    Why -(0.5 + 3*2^-23) rather than -0.5: __log2f is a fast hardware
-    approximation, not correctly rounded. Making the coefficient slightly
-    bigger in magnitude than 0.5 and rounding everything down biases the
-    result toward a *smaller* shift, so an approximation error can't push it
-    over the safe limit.
+    The coefficient: the paper uses 0.51. par_gemmul8 (following GEMMul8's
+    code) uses -0x1.000006p-1 = -(0.5 + 3*2^-23), which gives larger shifts
+    (more bits kept) than the paper would. We follow the code. Either way it is
+    slightly more than 0.5 and everything rounds down. That biases the result
+    toward a *smaller* shift, so an error in __log2f (a fast hardware
+    approximation, not correctly rounded) can't push it over the safe limit.
 
     Here: np.log2 on float32 stands in for __log2f. The two can differ in
     the last bit, and so, very rarely, the resulting shift could differ by one.
@@ -180,14 +201,14 @@ def refine_shifts(C_hi, shiftA, shiftB, num_moduli):
     """Phase C: final shifts (scaling_accu.hpp: refine_shift_rowwise_kernel
     for A, refine_shift_colwise_kernel for B).
 
-    SIGN CONVENTION CHANGE. On input, shiftA/B are exponents to multiply by
-    (phase A). On output they are *negated*: shiftA_out = -(shiftA_in + extra).
-    From here on
+    SIGN CONVENTION CHANGE. On input, shiftA/B are the exponents of the
+    paper's mu', nu' (multiply by 2^shift). On output they are *negated*:
+    shiftA_out = -(shiftA_in + extra), i.e. mu_i = 2^-shiftA[i]. From here on
 
-        A_core = trunc(A * 2^-shiftA)   and   A ~= A_core * 2^shiftA,
+        A' = trunc(A * 2^-shiftA)   and   A ~= A' * 2^shiftA,
 
-    so shiftA is "the exponent that undoes the scaling", which is what
-    inverse scaling needs.
+    so shiftA is the exponent of mu^-1: the one that undoes the scaling in
+    step 4, C = diag(mu^-1) C'' diag(nu^-1).
     """
     extraA = compute_shift(C_hi.max(axis=1), num_moduli)  # row max, per row of A
     extraB = compute_shift(C_hi.max(axis=0), num_moduli)  # col max, per col of B
@@ -200,12 +221,12 @@ def refine_shifts(C_hi, shiftA, shiftB, num_moduli):
 
 
 def trunc_core(A, shiftA, B, shiftB):
-    """Phase D: A_core = trunc(A * 2^-shiftA), B_core = trunc(B * 2^-shiftB)
-    (scaling_core.hpp: trunc_core_launch, with TruncScalbn from
-    scaling_trunc.hpp).
+    """Phase D: A' = trunc(diag(mu) A), B' = trunc(B diag(nu)) (Algorithm 1
+    lines 2-3; par_gemmul8: A_core, B_core from scaling_core.hpp:
+    trunc_core_launch, with TruncScalbn from scaling_trunc.hpp).
 
     Truncation (round toward zero) never increases a magnitude, so the phase C
-    bound still holds for the truncated matrices.
+    bound (eq. 3) still holds for the truncated matrices.
 
     Representation: np.ldexp multiplies by a power of two exactly (a
     subnormal result is < 1 and truncates to 0 anyway), and np.trunc of a
@@ -229,12 +250,12 @@ def trunc_core(A, shiftA, B, shiftB):
 def scaling(A, B, num_moduli):
     """seq::scaling (src/seq/seq_scaling.cu): phases A-D.
 
-    Returns a dict with the intermediates:
-      shiftA0, shiftB0   phase A shifts (exponents to multiply by)
-      A_bound, B_bound   phase A int8 upper bounds
-      C_hi_bound         phase B int32 bound product
-      shiftA, shiftB     phase C final shifts (exponents that undo scaling)
-      A_core, B_core     phase D integer matrices (float64 storage)
+    Returns a dict with the intermediates (paper symbol in brackets):
+      shiftA0, shiftB0   phase A exponents: mu'_i = 2^shiftA0[i]   [mu', nu']
+      A_bound, B_bound   phase A int8 upper bounds                 [Abar, Bbar]
+      C_hi_bound         phase B int32 bound product               [Cbar]
+      shiftA, shiftB     phase C exponents: mu_i = 2^-shiftA[i]    [mu, nu]
+      A_core, B_core     phase D integer matrices (float64 storage) [A', B']
     """
     check_num_moduli(num_moduli)
     A_bound, shiftA0, B_bound, shiftB0 = extract_bound(A, B)

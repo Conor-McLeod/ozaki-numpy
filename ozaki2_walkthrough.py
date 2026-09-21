@@ -11,7 +11,7 @@ def _():
     from fractions import Fraction
 
     from ozaki2 import ozaki_gemm
-    from ozaki2.crt_tables import MODULI, crt_weights, log2P, modulus_product
+    from ozaki2.crt_tables import MODULI, crt_weights, log2P, moduli_product
     from ozaki2.inverse_scaling import crt_reconstruct, inverse_scaling
     from ozaki2.moduli import moduli_expand, moduli_gemm_loop
     from ozaki2.scaling import bound_gemm, extract_bound, refine_shifts, trunc_core
@@ -29,7 +29,7 @@ def _():
         mo,
         moduli_expand,
         moduli_gemm_loop,
-        modulus_product,
+        moduli_product,
         np,
         ozaki_gemm,
         refine_shifts,
@@ -47,20 +47,23 @@ def _(mo):
 
     The plan:
 
-    1. **Scale** each row of $A$ and each column of $B$ by a power of two, then
-       truncate, giving integer matrices $A_\text{core}$ and $B_\text{core}$.
-       The scales are chosen so that every entry of
-       $X = A_\text{core} B_\text{core}$ satisfies $|X| < M/2$, where
-       $M = p_0 p_1 \cdots p_{N-1}$ is the product of $N$ moduli.
-    2. For each modulus $p_i$, take residues $A_\text{core} \bmod p_i$ and
-       $B_\text{core} \bmod p_i$. They fit in int8, so the product
-       $X \bmod p_i$ can be computed with **one int8 GEMM**.
-    3. Rebuild $X$ from its $N$ residues with the **Chinese Remainder Theorem**,
-       then undo the power-of-two scaling.
+    1. **Scale** each row of $A$ and each column of $B$ by a power of two
+       (scale vectors $\mu$, $\nu$), then truncate, giving integer matrices
+       $A' = \operatorname{trunc}(\operatorname{diag}(\mu) A)$ and
+       $B' = \operatorname{trunc}(B \operatorname{diag}(\nu))$. The scales are
+       chosen so that $2 \sum_h |a'_{ih}| |b'_{hj}| < \mathcal{P}$, where
+       $\mathcal{P} = p_1 p_2 \cdots p_N$ is the product of $N$ moduli.
+    2. For each modulus $p_i$, take residues $A'_i = \operatorname{rmod}(A', p_i)$
+       and $B'_i = \operatorname{rmod}(B', p_i)$. They fit in int8, so
+       $A'B' \bmod p_i$ can be computed with **one int8 GEMM**.
+    3. Rebuild $C'' = A'B'$ from its $N$ residues with the **Chinese Remainder
+       Theorem**, then undo the scaling: $C = \operatorname{diag}(\mu^{-1})\, C'' \operatorname{diag}(\nu^{-1})$.
 
-    Each cell below is one phase of `seq::ozaki_gemm` in par_gemmul8, calling
-    the matching function from the `ozaki2` package. The docstrings there
-    name the CUDA kernels.
+    The notation is the paper's (Uchino, Ozaki, Imamura, SC Workshops '25,
+    `ozaki2.pdf`). Each cell below is one phase of `seq::ozaki_gemm` in
+    par_gemmul8, calling the matching function from the `ozaki2` package. The
+    variable names are par_gemmul8's (`A_core` for $A'$, `A_lo` for $A'_i$, …),
+    and the docstrings name the CUDA kernels.
     """)
     return
 
@@ -91,30 +94,32 @@ def _(mo):
 
     They form a pairwise coprime set, meaning that no pair of integers taken from this set share any non-zero prime factors. This is a property required for the Chinese Remainder Theorem to hold.
 
-    $M$ is the extremely large number we get from multiplying all the pairwise coprime moduli together.
-    $$M = \prod_{i=1}^N p_i$$
+    $\mathcal{P}$ is the extremely large number we get from multiplying all the pairwise coprime moduli together.
+    $$\mathcal{P} = \prod_{i=1}^N p_i$$
 
     But why this set of pairwise coprime integers specifically? Theyy
 
-    $\log_2(\sqrt{\frac{M-1}{2}})$ is `log2P`.
-    - So `log20` is the number you have to raise 2 to to get $\sqrt{\frac{M-1}{2}}$.
-    - So by definition if you raise 2 to $\log_2(\sqrt{\frac{M-1}{2}})$ you get $\sqrt{\frac{M-1}{2}}$.
+    $\log_2(\sqrt{\frac{\mathcal{P}-1}{2}})$ is `log2P`.
+    - So `log20` is the number you have to raise 2 to to get $\sqrt{\frac{\mathcal{P}-1}{2}}$.
+    - So by definition if you raise 2 to $\log_2(\sqrt{\frac{\mathcal{P}-1}{2}})$ you get $\sqrt{\frac{\mathcal{P}-1}{2}}$.
 
     Scaling picks shifts so that each each entry of $A_{core} B_{core}$ is at most `2^log2P * 2^log2P`
 
-    $$2^{\log_2(\sqrt{\frac{M-1}{2}})} \cdot 2^{\log_2(\sqrt{\frac{M-1}{2}})} = \sqrt{\frac{M-1}{2}} \ \cdot \sqrt{\frac{M-1}{2}} = \frac{M - 1}{2}$$
+    $$2^{\log_2(\sqrt{\frac{\mathcal{P}-1}{2}})} \cdot 2^{\log_2(\sqrt{\frac{\mathcal{P}-1}{2}})} = \sqrt{\frac{\mathcal{P}-1}{2}} \ \cdot \sqrt{\frac{\mathcal{P}-1}{2}} = \frac{\mathcal{P} - 1}{2}$$
     """)
     return
 
 
 @app.cell
-def _(MODULI, log2P, modulus_product, num_moduli_slider):
+def _(MODULI, log2P, moduli_product, num_moduli_slider):
     N = num_moduli_slider.value
-    M = modulus_product(N)
+    # The paper's 𝒫 (positive). Not called P, because par_gemmul8's `P` table
+    # holds -𝒫.
+    calP = moduli_product(N)
     print(f"moduli     : {MODULI[:N]}")
-    print(f"M          = {M}  (~2^{M.bit_length() - 1})")
-    print(f"log2P      = {log2P(N)}  (bit budget of one factor: log2(sqrt((M-1)/2)))")
-    return M, N
+    print(f"𝒫          = {calP}  (~2^{calP.bit_length() - 1})")
+    print(f"log2P      = {log2P(N)}  (𝒫'_accu, bit budget of one factor: log2(sqrt((𝒫-1)/2)))")
+    return N, calP
 
 
 @app.cell(hide_code=True)
@@ -123,10 +128,14 @@ def _(mo):
     ## Phase A: first-pass shifts and int8 upper bounds
 
     For each row of $A$ (column of $B$), find the absolute max and choose
-    `shift = 5 - floor(log2(amax))`, so that the max scaled by $2^\text{shift}$
-    lands in $[32, 64)$. Then round $|A|$ **up** at that scale:
-    `A_bound = ceil(|A| * 2^shift)`. That gives small nonnegative int8
-    numbers, each at least as large as the scaled element it came from.
+    $\mu'_i = 2^{5 - \lfloor \log_2 \max_h |a_{ih}| \rfloor}$, so that the max
+    scaled by $\mu'_i$ lands in $[32, 64)$. Then round $|A|$ **up** at that scale:
+    $\bar{A} = \lceil \operatorname{diag}(\mu') |A| \rceil$. That gives small
+    nonnegative int8 numbers, each at least as large as the scaled element it
+    came from.
+
+    par_gemmul8: `shiftA0` holds the exponent ($\mu'_i = 2^\text{shiftA0[i]}$),
+    and `A_bound` is $\bar{A}$.
     """)
     return
 
@@ -145,8 +154,9 @@ def _(mo):
     mo.md(r"""
     ## Phase B: bound the product with one int8 GEMM
 
-    `C_hi = A_bound @ B_bound` bounds $|A|\,|B|$ entrywise (in the scaled units)
-    and costs one cheap int8 GEMM instead of a floating-point one.
+    $\bar{C} = \bar{A}\bar{B}$ (par_gemmul8: `C_hi`) bounds
+    $\operatorname{diag}(\mu')\,|A|\,|B| \operatorname{diag}(\nu')$ entrywise, and
+    costs one cheap int8 GEMM instead of a floating-point one.
     """)
     return
 
@@ -163,13 +173,19 @@ def _(mo):
     mo.md(r"""
     ## Phase C: refine the shifts
 
-    Each factor has a budget of `log2P` bits. Row $i$'s products use up to
-    `log2(max C_hi[i, :])` of the combined budget, so row $i$ of $A$ can be
-    scaled up by another `floor(log2P - log2(rowmax)/2)` bits (and column $j$ of
-    $B$ likewise). This guarantees $|A_\text{core} B_\text{core}| < M/2$.
+    Each factor has a budget of $\mathcal{P}'_\text{accu}$ (`log2P`) bits. Row
+    $i$'s products use up to $\log_2 \max_h \bar{c}_{ih}$ of the combined
+    budget, so row $i$ of $A$ can be scaled up by more bits:
 
-    **Sign flip:** after this phase, `shiftA` is stored *negated*. It is now the
-    exponent that *undoes* the scaling: $A \approx A_\text{core} \cdot 2^{\text{shiftA}}$.
+    $$\mu_i = \mu'_i \cdot 2^{\lfloor \mathcal{P}'_\text{accu} - 0.51 \log_2 \max_h \bar{c}_{ih} \rfloor}$$
+
+    (and $\nu_j$ likewise). This guarantees $2 \sum_h |a'_{ih}| |b'_{hj}| < \mathcal{P}$.
+    The paper uses 0.51. par_gemmul8's code uses $0.5 + 3 \cdot 2^{-23}$, which
+    keeps a few more bits, and we follow the code.
+
+    **Sign flip:** after this phase, `shiftA` is stored *negated*: it is the
+    exponent of $\mu^{-1}$, the one that *undoes* the scaling
+    ($\mu_i = 2^{-\text{shiftA[i]}}$, and $A \approx A' \cdot 2^{\text{shiftA}}$).
     """)
     return
 
@@ -186,25 +202,27 @@ def _(mo):
     mo.md(r"""
     ## Phase D: truncate to integers
 
-    `A_core = trunc(A * 2^-shiftA)`. These are big integers, stored exactly in
-    float64 here (par_gemmul8 uses int32 / int64 / double depending on N).
-    Truncation is where the scheme loses accuracy: everything below the last
-    kept bit is dropped. More moduli → bigger $M$ → more bits kept.
+    $A' = \operatorname{trunc}(\operatorname{diag}(\mu) A)$ (par_gemmul8:
+    `A_core`). These are big integers, stored exactly in float64 here
+    (par_gemmul8 uses int32 / int64 / double depending on N). Truncation is
+    where the scheme loses accuracy: everything below the last kept bit is
+    dropped. More moduli → bigger $\mathcal{P}$ → more bits kept.
     """)
     return
 
 
 @app.cell
-def _(A, B, M, np, shiftA, shiftB, trunc_core):
+def _(A, B, calP, np, shiftA, shiftB, trunc_core):
     A_core, B_core = trunc_core(A, shiftA, B, shiftB)
     # Shown as Python ints: they are exact integers, just stored in float64.
     _to_int = np.vectorize(int, otypes=[object])
     print("A_core =\n", _to_int(A_core))
     print("B_core =\n", _to_int(B_core))
 
-    # Exact integer product, to check the |X| < M/2 guarantee.
+    # Exact integer product A'B', and a check of the paper's eq. 3.
     X_exact = _to_int(A_core) @ _to_int(B_core)
-    print("\nmax |A_core @ B_core| / (M/2) =", float(max(abs(x) for x in X_exact.flat) / (M / 2)))
+    _abs_sum = abs(_to_int(A_core)) @ abs(_to_int(B_core))
+    print("\nmax 2 * sum_h |a'_ih| |b'_hj| / 𝒫 =", float(max(2 * _x for _x in _abs_sum.flat) / calP), "(must be < 1)")
     return A_core, B_core, X_exact
 
 
@@ -213,9 +231,11 @@ def _(mo):
     mo.md(r"""
     ## Phase E: residues
 
-    For each modulus: `A_lo[i] = A_core mod p_i`, as the symmetric
-    representative in $[-p_i/2, p_i/2]$, so it fits in an int8. $B$ likewise.
-    Now $N$ small int8 matrices stand in for one big-integer matrix.
+    For each modulus: $A'_i = \operatorname{rmod}(A', p_i)$ with
+    $\operatorname{rmod}(x, p) = x - p \cdot \operatorname{round}(x/p)$, the
+    representative in $[-p_i/2, p_i/2]$, so it fits in an int8. $B$ likewise
+    (par_gemmul8: `A_lo[i]`, `B_lo[i]`). Now $N$ small int8 matrices stand in
+    for one big-integer matrix.
     """)
     return
 
@@ -234,12 +254,16 @@ def _(mo):
     mo.md(r"""
     ## The moduli GEMM loop
 
-    For each $i$: `C_hi = A_lo[i] @ B_lo[i]` (int8 GEMM, int32 result), then
-    `C_mid[i] = C_hi mod p_i`. This is where almost all the time goes on a GPU.
-    It's $N$ int8 GEMMs, independent of each other (which is what
-    par_gemmul8's parallel version distributes across GPUs).
+    For each $i$: $C'_i = A'_i B'_i$ (int8 GEMM, int32 result; par_gemmul8:
+    `C_hi`), then reduce it mod $p_i$ again (par_gemmul8: `C_mid[i]`). This is
+    where almost all the time goes on a GPU. It's $N$ int8 GEMMs, independent
+    of each other (which is what par_gemmul8's parallel version distributes
+    across GPUs).
 
-    Check: `C_mid[i]` really is the exact product `A_core @ B_core` mod $p_i$.
+    The paper reduces to *unsigned* $U_i = \operatorname{mod}(C'_i, p_i) \in [0, p_i)$.
+    par_gemmul8 uses the *signed* $\operatorname{rmod}$. Both are the same residue.
+
+    Check: `C_mid[i]` really is the exact product $A'B'$ mod $p_i$.
     """)
     return
 
@@ -252,7 +276,7 @@ def _(A_lo, B_lo, MODULI, X_exact, moduli_gemm_loop):
         ((C_mid[_i].astype(object) - X_exact) % _p == 0).all()
         for _i, _p in enumerate(MODULI[: C_mid.shape[0]])
     )
-    print("C_mid[i] == (A_core @ B_core) mod p_i for every i:", _ok)
+    print("C_mid[i] == A'B' mod p_i for every i:", _ok)
     return (C_mid,)
 
 
@@ -261,25 +285,27 @@ def _(mo):
     mo.md(r"""
     ## Inverse scaling: CRT, then undo the shifts
 
-    With the CRT weights $q\Pi_i$ ($\equiv 1 \bmod p_i$, $\equiv 0 \bmod p_j$):
+    With $q_i$ the inverse of $\mathcal{P}/p_i$ mod $p_i$, the CRT weights
+    $\frac{\mathcal{P}}{p_i} q_i$ (par_gemmul8: `qPi`) are $\equiv 1 \bmod p_i$ and
+    $\equiv 0 \bmod p_j$. So with $U_i$ = `C_mid[i]`:
 
-    $$S = \sum_i q\Pi_i \, c_i, \qquad X = S - M \cdot \operatorname{round}(S/M), \qquad C = X \cdot 2^{\text{shiftA}_i + \text{shiftB}_j}$$
+    $$C' = \sum_i \frac{\mathcal{P}}{p_i} q_i \, U_i, \qquad C'' = C' - \mathcal{P} \cdot \operatorname{round}(C'/\mathcal{P}), \qquad C = \operatorname{diag}(\mu^{-1})\, C'' \operatorname{diag}(\nu^{-1})$$
 
     First with exact Python integers, then the way par_gemmul8 does it in
-    doubles (double-double for $N > 6$).
+    doubles (split into two doubles, $s_{i1} + s_{i2}$, for $N > 6$).
     """)
     return
 
 
 @app.cell
-def _(C_mid, Fraction, M, N, X_exact, crt_reconstruct, crt_weights, np):
-    _S = sum(_w * C_mid[_i].astype(object) for _i, _w in enumerate(crt_weights(N)))
-    X_crt = np.vectorize(lambda s: s - M * round(Fraction(s, M)), otypes=[object])(_S)
-    print("exact CRT == A_core @ B_core:", (X_crt == X_exact).all())
+def _(C_mid, Fraction, N, X_exact, calP, crt_reconstruct, crt_weights, np):
+    _C1 = sum(_w * C_mid[_i].astype(object) for _i, _w in enumerate(crt_weights(N)))
+    _C2 = np.vectorize(lambda c: c - calP * round(Fraction(c, calP)), otypes=[object])(_C1)
+    print("exact CRT C'' == A'B':", (_C2 == X_exact).all())
 
-    X_float = crt_reconstruct(C_mid, N)
-    _err = max(abs(Fraction(_g) - _x) for _g, _x in zip(X_float.flat, X_exact.flat))
-    print("float CRT abs error:", float(_err), "  (relative to M:", float(_err / M), ")")
+    _C2_float = crt_reconstruct(C_mid, N)
+    _err = max(abs(Fraction(_g) - _x) for _g, _x in zip(_C2_float.flat, X_exact.flat))
+    print("float CRT abs error:", float(_err), "  (relative to 𝒫:", float(_err / calP), ")")
     return
 
 
@@ -299,7 +325,7 @@ def _(mo):
     ## Accuracy vs number of moduli
 
     Relative error against the exact product (computed with fractions). Each
-    extra modulus adds ~8 bits to $M$, so ~4 more bits per factor, until the
+    extra modulus adds ~8 bits to $\mathcal{P}$, so ~4 more bits per factor, until the
     float64 limit (~1e-16) is reached around $N \approx 14$.
     """)
     return

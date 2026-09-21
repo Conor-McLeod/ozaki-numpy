@@ -52,8 +52,9 @@ def test_qPi_double2_matches_vendored(n):
 
 @pytest.mark.parametrize("n", DOUBLE2_N)
 def test_qPi_double2_split_properties(n):
-    """hi is qPi_i with its low s bits cleared, lo is the rest (rounded to a
-    double for N >= 13), and the hi-part CRT sum can't round."""
+    """s_i1 is the weight with its low s bits cleared, s_i2 is the rest
+    (rounded to a double for N >= 13), and C'(1) = sum_i s_i1 * U_i can't
+    round (paper eq. 6)."""
     s = t.QPI_DOUBLE2_SPLIT_BITS[n]
     worst = 0
     for w, (hi, lo), p in zip(t.crt_weights(n), t.qPi_double2(n), t.MODULI):
@@ -62,6 +63,13 @@ def test_qPi_double2_split_properties(n):
         worst += int(hi) * (p // 2 + 1)  # |C_mid_i| <= p/2 (128 for p = 256)
     # All partial sums of hi_i * c_i are multiples of 2^s below 2^(s+53).
     assert worst < 2 ** (s + 53)
+
+
+@pytest.mark.parametrize("n", DOUBLE2_N)
+def test_vendored_split_keeps_1_to_2_more_bits_than_paper_eq6(n):
+    """par_gemmul8's qPi_2 table splits 1-2 bits lower than paper eq. 6."""
+    diff = t.qPi_double2_split_bits_paper(n) - t.QPI_DOUBLE2_SPLIT_BITS[n]
+    assert diff == (2 if n in (17, 18) else 1)
 
 
 @pytest.mark.parametrize("n", ALL_N)

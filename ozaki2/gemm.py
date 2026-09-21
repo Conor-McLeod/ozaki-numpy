@@ -1,11 +1,12 @@
 """The whole pipeline: C = A @ B via Ozaki Scheme II.
 
-CUDA counterpart: par_gemmul8/src/seq/seq_ozaki_gemm.cu (seq::ozaki_gemm).
+Paper: Algorithm 1 (DGEMM emulation, accurate mode). CUDA counterpart:
+par_gemmul8/src/seq/seq_ozaki_gemm.cu (seq::ozaki_gemm).
 
-    scaling            phases A-D   ozaki2/scaling.py
-    moduli_expand      phase E      ozaki2/moduli.py
-    moduli_gemm_loop                ozaki2/moduli.py
-    inverse_scaling                 ozaki2/inverse_scaling.py
+    scaling            phases A-D   lines 1-3    ozaki2/scaling.py
+    moduli_expand      phase E      lines 4-5    ozaki2/moduli.py
+    moduli_gemm_loop                lines 6-7    ozaki2/moduli.py
+    inverse_scaling                 lines 8-12   ozaki2/inverse_scaling.py
 
 Not reproduced (none of it changes the arithmetic): the workspace (the
 preallocated buffers A_lo, B_lo, C_hi, C_mid, shiftA, shiftB, A_core, B_core),
@@ -22,41 +23,43 @@ from .inverse_scaling import inverse_scaling
 from .moduli import moduli_expand, moduli_gemm_loop
 from .scaling import scaling
 
-# int8_gemm accumulates up to k products of magnitude <= 128*128 in int32.
-_MAX_K = (2**31 - 1) // (128 * 128)
+# Paper Section 4.3: k <= 2^17 keeps the int32 GEMMs correct (see
+# scaling.int8_gemm).
+_MAX_K = 2**17
 
 
 @dataclass
 class OzakiTrace:
-    """Every intermediate of one ozaki_gemm call, named as in par_gemmul8."""
+    """Every intermediate of one ozaki_gemm call, named as in par_gemmul8.
+    The paper's symbol is in brackets."""
 
-    num_moduli: int
+    num_moduli: int  # [N]
     # phase A
-    shiftA0: np.ndarray  # (m,)  int16, exponent to multiply by
-    shiftB0: np.ndarray  # (n,)
-    A_bound: np.ndarray  # (m, k) int8
-    B_bound: np.ndarray  # (k, n) int8
+    shiftA0: np.ndarray  # (m,) int16, mu'_i = 2^shiftA0[i]    [mu']
+    shiftB0: np.ndarray  # (n,)        nu'_j = 2^shiftB0[j]    [nu']
+    A_bound: np.ndarray  # (m, k) int8                          [Abar]
+    B_bound: np.ndarray  # (k, n) int8                          [Bbar]
     # phase B
-    C_hi_bound: np.ndarray  # (m, n) int32
+    C_hi_bound: np.ndarray  # (m, n) int32                      [Cbar]
     # phase C
-    shiftA: np.ndarray  # (m,) int16, exponent that undoes the scaling
-    shiftB: np.ndarray  # (n,)
+    shiftA: np.ndarray  # (m,) int16, mu_i = 2^-shiftA[i]       [mu]
+    shiftB: np.ndarray  # (n,)        nu_j = 2^-shiftB[j]       [nu]
     # phase D
-    A_core: np.ndarray  # (m, k) integer-valued float64
-    B_core: np.ndarray  # (k, n)
+    A_core: np.ndarray  # (m, k) integer-valued float64         [A']
+    B_core: np.ndarray  # (k, n)                                [B']
     # phase E
-    A_lo: np.ndarray  # (num_moduli, m, k) int8
-    B_lo: np.ndarray  # (num_moduli, k, n) int8
+    A_lo: np.ndarray  # (num_moduli, m, k) int8                 [A'_i]
+    B_lo: np.ndarray  # (num_moduli, k, n) int8                 [B'_i]
     # moduli GEMM loop
-    C_mid: np.ndarray  # (num_moduli, m, n) int8
+    C_mid: np.ndarray  # (num_moduli, m, n) int8                [U_i, signed]
     # inverse scaling
-    C: np.ndarray  # (m, n) float64
+    C: np.ndarray  # (m, n) float64                             [C]
 
 
 def ozaki_gemm(A, B, num_moduli, trace=False):
     """C = A @ B for float64 A (m, k) and B (k, n), using num_moduli int8 GEMMs.
 
-    More moduli means a larger M, more bits kept in A_core/B_core, and a more
+    More moduli means a larger 𝒫, more bits kept in A'/B', and a more
     accurate C: roughly 4 bits per modulus per factor. Around 14+ moduli it is
     about as accurate as a float64 GEMM.
 
