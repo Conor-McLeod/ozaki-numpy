@@ -10,7 +10,7 @@ print(B)
 
 
 # naive implementation to begin with
-def split_into_quarters(matrix):
+def split_into_quarters(matrix, as_tuple=True):
     rows, cols = matrix.shape
     if rows % 2 != 0 or cols % 2 != 0:
         raise ValueError("Matrix dimensions must be divisible by 2")
@@ -36,7 +36,10 @@ def split_into_quarters(matrix):
             ]
             blocks.append(block)
 
-    return tuple(blocks)
+    if as_tuple:
+        return tuple(blocks)
+    
+    return np.block([blocks[0:2], blocks[2:4]])
 
 
 # [A00 A01]
@@ -48,6 +51,8 @@ C00 = (A00 @ B00) + (A01 @ B10)
 C01 = (A00 @ B01) + (A01 @ B11)
 C10 = (A10 @ B00) + (A11 @ B10)
 C11 = (A10 @ B01) + (A11 @ B11)
+
+A_blocked
 
 # Reassemble
 C_blocked = np.block([[C00, C01], [C10, C11]])
