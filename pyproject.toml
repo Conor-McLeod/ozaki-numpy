@@ -14,3 +14,9 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.uv]
+# Only resolve package versions published at least a week ago, as a buffer
+# against compromised releases. Set here, not only in a machine's global uv
+# config, so every machine writes the same uv.lock.
+exclude-newer = "1 week"
