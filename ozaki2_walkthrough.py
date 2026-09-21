@@ -82,6 +82,31 @@ def _(np):
     return A, B
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    As part of the Chinese Remainder Theorem we use the . When we say "moduli", we are referring to the integers that may be used for $m$ in each congruence
+
+    The moduli are taken from the existing set of: 256, 255, 253, 251, 247, 241, 239, 233, 229, 227, 223, 217, 211, 199, 197, 193, 191, 181, 179, 173. These are largest 20 pairwise coprime moduli smaller than or equal to 256.
+
+    They form a pairwise coprime set, meaning that no pair of integers taken from this set share any non-zero prime factors. This is a property required for the Chinese Remainder Theorem to hold.
+
+    $M$ is the extremely large number we get from multiplying all the pairwise coprime moduli together.
+    $$M = \prod_{i=1}^N p_i$$
+
+    But why this set of pairwise coprime integers specifically? Theyy
+
+    $\log_2(\sqrt{\frac{M-1}{2}})$ is `log2P`.
+    - So `log20` is the number you have to raise 2 to to get $\sqrt{\frac{M-1}{2}}$.
+    - So by definition if you raise 2 to $\log_2(\sqrt{\frac{M-1}{2}})$ you get $\sqrt{\frac{M-1}{2}}$.
+
+    Scaling picks shifts so that each each entry of $A_{core} B_{core}$ is at most `2^log2P * 2^log2P`
+
+    $$2^{\log_2(\sqrt{\frac{M-1}{2}})} \cdot 2^{\log_2(\sqrt{\frac{M-1}{2}})} = \sqrt{\frac{M-1}{2}} \ \cdot \sqrt{\frac{M-1}{2}} = \frac{M - 1}{2}$$
+    """)
+    return
+
+
 @app.cell
 def _(MODULI, log2P, modulus_product, num_moduli_slider):
     N = num_moduli_slider.value
